@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailctl"
+version = "0.1.0"
+description = "A lightweight, agent-friendly email CLI written in Python."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "keyring>=25.6.0",
+  "SecretStorage>=3.3.3; sys_platform == 'linux'",
+]
+
+[project.scripts]
+mailctl = "mailctl:main"
+
+[tool.setuptools]
+py-modules = ["mailctl"]
