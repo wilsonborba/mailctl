@@ -63,6 +63,45 @@ class MailCtlTestCase(unittest.TestCase):
             "MAILCTL_PASSWORD_MY_PERSONAL_ACCOUNT",
         )
 
+    def test_keyring_store_and_lookup(self) -> None:
+        fake_backend = mock.Mock()
+        fake_backend.__class__.__name__ = "SecretService"
+        fake_keyring = mock.Mock()
+        fake_keyring.get_keyring.return_value = fake_backend
+        fake_keyring.get_password.return_value = "stored-password"
+        with mock.patch.object(mailctl, "keyring", fake_keyring):
+            mailctl.save_password("personal", "user@gmail.com", "stored-password")
+            value = mailctl.get_stored_password("personal", "user@gmail.com")
+        self.assertEqual(value, "stored-password")
+        fake_keyring.set_password.assert_called_once()
+
+    def test_account_add_stores_password_in_keyring(self) -> None:
+        fake_backend = mock.Mock()
+        fake_backend.__class__.__name__ = "SecretService"
+        fake_keyring = mock.Mock()
+        fake_keyring.get_keyring.return_value = fake_backend
+        args = SimpleNamespace(
+            json=True,
+            alias="personal",
+            email="user@gmail.com",
+            name="User Name",
+            provider="gmail",
+            smtp_host=None,
+            smtp_port=None,
+            imap_host=None,
+            imap_port=None,
+            skip_password=False,
+        )
+        out = io.StringIO()
+        with mock.patch.object(mailctl, "keyring", fake_keyring):
+            with mock.patch("mailctl.getpass.getpass", return_value="app-password"):
+                with redirect_stdout(out):
+                    code = mailctl.command_account_add(args)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["result"]["credential_store"], "keyring")
+        fake_keyring.set_password.assert_called_once()
+
     def test_compose_message_with_headers_and_attachment(self) -> None:
         config = self.save_config()
         attachment = self.home / "cv.pdf"
@@ -214,7 +253,7 @@ class MailCtlTestCase(unittest.TestCase):
         smtp_context.__enter__.return_value = smtp_client
         smtp_context.__exit__.return_value = False
         imap_client = mock.MagicMock()
-        with mock.patch.dict(os.environ, {"MAILCTL_PASSWORD_PERSONAL": "app-password"}, clear=False):
+        with mock.patch("mailctl.get_stored_password", return_value="app-password"):
             with mock.patch("mailctl.smtplib.SMTP_SSL", return_value=smtp_context):
                 with mock.patch("mailctl.imaplib.IMAP4_SSL", return_value=imap_client):
                     result = mailctl.account_connectivity_check(self.save_config()["accounts"]["personal"], "personal")

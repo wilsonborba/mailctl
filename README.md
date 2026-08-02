@@ -10,13 +10,32 @@
 
 ## Installation
 
-Run:
+Fast path:
+
+```bash
+./install.sh
+```
+
+Manual path:
 
 ```bash
 python3 mailctl.py install
 ```
 
-This installs the executable to `~/.local/bin/mailctl`.
+What installation does:
+
+- creates a dedicated runtime in `~/.local/share/mailctl/.venv`
+- installs project dependencies from `pyproject.toml`
+- creates the launcher at `~/.local/bin/mailctl`
+- prints help at the end
+
+The runtime dependency declaration lives in `pyproject.toml`.
+
+If you prefer, you can also install with pip from the project root:
+
+```bash
+python3 -m pip install .
+```
 
 If `~/.local/bin` is not in your `PATH`, add it manually:
 
@@ -44,23 +63,35 @@ mailctl uninstall
 
 `mailctl` does not use Gmail API, OAuth, or web scraping.
 
-## Safe password usage
+## Secure password storage
 
-Recommended:
+Primary flow:
 
-```bash
-read -rsp "Gmail App Password: " MAILCTL_PASSWORD_PERSONAL
-export MAILCTL_PASSWORD_PERSONAL
-echo
-```
+- `mailctl account add` prompts for the Gmail App Password securely
+- the password is stored in the system keyring
+- later commands reuse it automatically
 
-Not recommended:
+Check storage status:
 
 ```bash
-export MAILCTL_PASSWORD_PERSONAL="senha"
+mailctl account password status personal
 ```
 
-Inline export may leave the secret in shell history.
+Update a stored password:
+
+```bash
+mailctl account password set personal
+```
+
+Delete a stored password:
+
+```bash
+mailctl account password delete personal
+```
+
+Environment variables are supported only as a compatibility fallback, not as the main setup flow.
+
+If your Debian system does not have a usable unlocked keyring backend, install and unlock one such as `gnome-keyring`.
 
 ## Account configuration
 
@@ -74,6 +105,8 @@ mailctl account add \
   --provider gmail
 ```
 
+During `account add`, `mailctl` prompts for the App Password and stores it in the keyring by default.
+
 List accounts:
 
 ```bash
@@ -84,6 +117,12 @@ Select the default account:
 
 ```bash
 mailctl account use personal
+```
+
+Use another configured account for one command:
+
+```bash
+mailctl send --account work --to hr@company.com --subject "Hello" --body "Hi"
 ```
 
 Test SMTP and IMAP authentication without sending email:
@@ -241,7 +280,7 @@ Error format:
 ## Security
 
 - Uses verified TLS with `ssl.create_default_context()`
-- Does not store App Passwords in config or history
+- Stores App Passwords in the system keyring instead of `config.json`
 - Does not print secrets in normal output
 - Sanitizes downloaded attachment names
 - Does not render HTML, execute scripts, open links, or fetch remote images
@@ -258,6 +297,7 @@ History stores safe metadata only: recipients, subject, attachment names, messag
 
 ## Limitations
 
+- Secure password persistence depends on a usable system keyring backend
 - Gmail support in this MVP assumes App Password authentication
 - SMTP/IMAP cannot guarantee universal server-side draft behavior
 - SMTP/IMAP cannot guarantee that a message never lands in spam

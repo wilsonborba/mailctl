@@ -14,8 +14,10 @@ import re
 import shutil
 import smtplib
 import ssl
+import subprocess
 import sys
 import uuid
+import venv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email import policy
@@ -26,6 +28,18 @@ from pathlib import Path
 from socket import timeout as SocketTimeout
 from typing import Any
 import getpass
+
+try:
+    import keyring
+    from keyring.errors import KeyringError, NoKeyringError
+except ImportError:
+    keyring = None
+
+    class KeyringError(Exception):
+        pass
+
+    class NoKeyringError(KeyringError):
+        pass
 
 
 EXIT_OK = 0
@@ -40,6 +54,7 @@ EXIT_CONFLICT = 9
 
 TIMEOUT_SECONDS = 20
 GMAIL_WARNING_SIZE = 20 * 1024 * 1024
+KEYRING_SERVICE = "mailctl"
 
 
 class MailCtlError(Exception):
@@ -93,6 +108,18 @@ def drafts_root() -> Path:
 
 def install_path() -> Path:
     return Path.home() / ".local" / "bin" / "mailctl"
+
+
+def runtime_root() -> Path:
+    return Path.home() / ".local" / "share" / "mailctl"
+
+
+def runtime_venv_path() -> Path:
+    return runtime_root() / ".venv"
+
+
+def runtime_python_path() -> Path:
+    return runtime_venv_path() / "bin" / "python"
 
 
 def default_download_dir() -> Path:
@@ -206,6 +233,77 @@ def password_env_name(alias: str) -> str:
     return f"MAILCTL_PASSWORD_{clean}"
 
 
+def keyring_username(alias: str, email_address: str) -> str:
+    return f"{alias}:{email_address.lower()}"
+
+
+def has_keyring_library() -> bool:
+    return keyring is not None
+
+
+def keyring_backend_name() -> str | None:
+    if not has_keyring_library():
+        return None
+    try:
+        backend = keyring.get_keyring()
+    except Exception:
+        return None
+    return backend.__class__.__name__
+
+
+def ensure_keyring_ready() -> None:
+    if not has_keyring_library():
+        raise MailCtlError(
+            "secure credential support is not installed. reinstall mailctl with pyproject dependencies or run install.sh",
+            exit_code=EXIT_CONFIG,
+            error_type="configuration_error",
+        )
+    backend = keyring.get_keyring()
+    if backend.__class__.__name__.lower().startswith("fail"):
+        raise MailCtlError(
+            "no usable system keyring backend is available. on Debian Linux, install and unlock a Secret Service backend such as gnome-keyring",
+            exit_code=EXIT_CONFIG,
+            error_type="configuration_error",
+        )
+
+
+def save_password(alias: str, email_address: str, password: str) -> None:
+    ensure_keyring_ready()
+    if not password:
+        raise MailCtlError(
+            "empty password not allowed",
+            exit_code=EXIT_AUTH,
+            error_type="authentication_error",
+        )
+    try:
+        keyring.set_password(KEYRING_SERVICE, keyring_username(alias, email_address), password)
+    except (KeyringError, RuntimeError) as exc:
+        raise MailCtlError(
+            f"failed to store password securely: {exc}",
+            exit_code=EXIT_CONFIG,
+            error_type="configuration_error",
+        ) from exc
+
+
+def delete_password(alias: str, email_address: str) -> bool:
+    if not has_keyring_library():
+        return False
+    try:
+        keyring.delete_password(KEYRING_SERVICE, keyring_username(alias, email_address))
+        return True
+    except Exception:
+        return False
+
+
+def get_stored_password(alias: str, email_address: str) -> str | None:
+    if not has_keyring_library():
+        return None
+    try:
+        return keyring.get_password(KEYRING_SERVICE, keyring_username(alias, email_address))
+    except Exception:
+        return None
+
+
 def validate_email(address: str) -> str:
     address = address.strip()
     _, parsed = email.utils.parseaddr(address)
@@ -253,14 +351,17 @@ def get_account(config: dict[str, Any], alias: str | None) -> tuple[str, dict[st
     return use_alias, account
 
 
-def get_password(alias: str, *, interactive: bool = True) -> str:
+def get_password(alias: str, email_address: str, *, interactive: bool = True, persist_prompt: bool = False) -> str:
+    stored = get_stored_password(alias, email_address)
+    if stored:
+        return stored
     env_name = password_env_name(alias)
     value = os.environ.get(env_name)
     if value:
         return value
     if not interactive:
         raise MailCtlError(
-            f"password not available in environment variable {env_name}",
+            f"password not available in keyring or environment variable {env_name}",
             exit_code=EXIT_AUTH,
             error_type="authentication_error",
         )
@@ -271,6 +372,8 @@ def get_password(alias: str, *, interactive: bool = True) -> str:
             exit_code=EXIT_AUTH,
             error_type="authentication_error",
         )
+    if persist_prompt and has_keyring_library():
+        save_password(alias, email_address, value)
     return value
 
 
@@ -434,7 +537,7 @@ def load_history() -> list[dict[str, Any]]:
 
 
 def account_connectivity_check(account: dict[str, Any], alias: str) -> dict[str, str]:
-    password = get_password(alias)
+    password = get_password(alias, account["email"])
     email_addr = account["email"]
     try:
         with smtplib.SMTP_SSL(
@@ -595,7 +698,7 @@ def summarize_message(build: MessageBuildResult) -> dict[str, Any]:
 
 
 def send_via_smtp(build: MessageBuildResult, account: dict[str, Any], alias: str) -> None:
-    password = get_password(alias)
+    password = get_password(alias, account["email"])
     try:
         with smtplib.SMTP_SSL(
             account["smtp_host"],
@@ -626,7 +729,7 @@ def send_via_smtp(build: MessageBuildResult, account: dict[str, Any], alias: str
 
 
 def connect_imap(account: dict[str, Any], alias: str) -> imaplib.IMAP4_SSL:
-    password = get_password(alias)
+    password = get_password(alias, account["email"])
     try:
         client = imaplib.IMAP4_SSL(
             account["imap_host"],
@@ -773,17 +876,50 @@ def format_human_summary(summary: dict[str, Any]) -> str:
 
 
 def command_install(args: argparse.Namespace) -> int:
-    source = Path(__file__).resolve()
+    project_root = Path(__file__).resolve().parent
+    venv_path = runtime_venv_path()
+    ensure_dir(runtime_root())
+    try:
+        if not venv_path.exists():
+            venv.EnvBuilder(with_pip=True, clear=False, upgrade=False).create(venv_path)
+        python_bin = runtime_python_path()
+        if not python_bin.exists():
+            raise MailCtlError(
+                "virtual environment python was not created correctly",
+                exit_code=EXIT_CONFIG,
+                error_type="configuration_error",
+            )
+        subprocess.run(
+            [str(python_bin), "-m", "pip", "install", "--upgrade", "pip"],
+            check=True,
+            cwd=project_root,
+        )
+        subprocess.run(
+            [str(python_bin), "-m", "pip", "install", "."],
+            check=True,
+            cwd=project_root,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise MailCtlError(
+            f"installation failed: {exc}",
+            exit_code=EXIT_CONFIG,
+            error_type="configuration_error",
+        ) from exc
     target = install_path()
     ensure_dir(target.parent)
-    content = source.read_text(encoding="utf-8")
-    if not content.startswith("#!/usr/bin/env python3\n"):
-        content = "#!/usr/bin/env python3\n" + content
-    target.write_text(content, encoding="utf-8")
+    launcher = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            f'exec "{venv_path / "bin" / "mailctl"}" "$@"',
+            "",
+        ]
+    )
+    target.write_text(launcher, encoding="utf-8")
     os.chmod(target, 0o755)
     in_path = str(target.parent) in os.environ.get("PATH", "").split(os.pathsep)
     result = {
         "installed_to": str(target),
+        "runtime": str(venv_path),
         "path_ready": in_path,
         "path_hint": None if in_path else 'Add `export PATH="$HOME/.local/bin:$PATH"` to your shell config.',
     }
@@ -792,16 +928,20 @@ def command_install(args: argparse.Namespace) -> int:
 
 def command_uninstall(args: argparse.Namespace) -> int:
     target = install_path()
-    if not target.exists():
+    runtime = runtime_root()
+    if not target.exists() and not runtime.exists():
         raise MailCtlError(
-            "mailctl is not installed in ~/.local/bin",
+            "mailctl is not installed in ~/.local/bin or ~/.local/share/mailctl",
             exit_code=EXIT_CONFIG,
             error_type="configuration_error",
         )
-    if not confirm(f"Remove {target}?", assume_yes=getattr(args, "yes", False)):
+    if not confirm(f"Remove installed mailctl runtime from {target} and {runtime}?", assume_yes=getattr(args, "yes", False)):
         raise MailCtlError("operation canceled", exit_code=EXIT_CANCELED, error_type="canceled")
-    target.unlink()
-    return output_result(args, "uninstall", {"removed": str(target)})
+    if target.exists():
+        target.unlink()
+    if runtime.exists():
+        shutil.rmtree(runtime)
+    return output_result(args, "uninstall", {"removed": [str(target), str(runtime)]})
 
 
 def command_account_add(args: argparse.Namespace) -> int:
@@ -839,10 +979,22 @@ def command_account_add(args: argparse.Namespace) -> int:
             }
         )
     config["accounts"][alias] = account
+    if not getattr(args, "skip_password", False):
+        password = getpass.getpass(f"App Password for {alias}: ")
+        save_password(alias, email_addr, password)
     if not config.get("default_account"):
         config["default_account"] = alias
     save_config(config)
-    return output_result(args, "account_add", {"alias": alias, "env_password_var": password_env_name(alias)})
+    return output_result(
+        args,
+        "account_add",
+        {
+            "alias": alias,
+            "default": config.get("default_account") == alias,
+            "credential_store": "keyring" if not getattr(args, "skip_password", False) else "not_set",
+            "env_password_var": password_env_name(alias),
+        },
+    )
 
 
 def command_account_list(args: argparse.Namespace) -> int:
@@ -883,11 +1035,12 @@ def command_account_use(args: argparse.Namespace) -> int:
 
 def command_account_remove(args: argparse.Namespace) -> int:
     config = load_config(required=True)
-    alias, _ = get_account(config, args.alias)
+    alias, account = get_account(config, args.alias)
     del config["accounts"][alias]
     if config.get("default_account") == alias:
         config["default_account"] = next(iter(config["accounts"]), None)
     save_config(config)
+    delete_password(alias, account["email"])
     return output_result(args, "account_remove", {"removed": alias, "default_account": config.get("default_account")})
 
 
@@ -896,6 +1049,38 @@ def command_account_test(args: argparse.Namespace) -> int:
     alias, account = get_account(config, args.alias)
     result = account_connectivity_check(account, alias)
     return output_result(args, "account_test", {"alias": alias, **result})
+
+
+def command_account_password_set(args: argparse.Namespace) -> int:
+    config = load_config(required=True)
+    alias, account = get_account(config, args.alias)
+    password = getpass.getpass(f"App Password for {alias}: ")
+    save_password(alias, account["email"], password)
+    return output_result(
+        args,
+        "account_password_set",
+        {"alias": alias, "credential_store": "keyring", "backend": keyring_backend_name()},
+    )
+
+
+def command_account_password_delete(args: argparse.Namespace) -> int:
+    config = load_config(required=True)
+    alias, account = get_account(config, args.alias)
+    deleted = delete_password(alias, account["email"])
+    return output_result(args, "account_password_delete", {"alias": alias, "deleted": deleted})
+
+
+def command_account_password_status(args: argparse.Namespace) -> int:
+    config = load_config(required=True)
+    alias, account = get_account(config, args.alias)
+    result = {
+        "alias": alias,
+        "stored_in_keyring": bool(get_stored_password(alias, account["email"])),
+        "keyring_library": has_keyring_library(),
+        "keyring_backend": keyring_backend_name(),
+        "env_password_var": password_env_name(alias),
+    }
+    return output_result(args, "account_password_status", result)
 
 
 def maybe_write_draft(build: MessageBuildResult, args: argparse.Namespace) -> int:
@@ -1273,6 +1458,7 @@ def build_parser() -> argparse.ArgumentParser:
     account_add.add_argument("--smtp-port", type=int)
     account_add.add_argument("--imap-host")
     account_add.add_argument("--imap-port", type=int)
+    account_add.add_argument("--skip-password", action="store_true")
     account_add.set_defaults(func=command_account_add)
     account_list = account_sub.add_parser("list")
     add_json_flag(account_list)
@@ -1293,6 +1479,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(account_test)
     account_test.add_argument("alias")
     account_test.set_defaults(func=command_account_test)
+    account_password = account_sub.add_parser("password")
+    account_password_sub = account_password.add_subparsers(dest="account_password_command", required=True)
+    account_password_set = account_password_sub.add_parser("set")
+    add_json_flag(account_password_set)
+    account_password_set.add_argument("alias")
+    account_password_set.set_defaults(func=command_account_password_set)
+    account_password_delete = account_password_sub.add_parser("delete")
+    add_json_flag(account_password_delete)
+    account_password_delete.add_argument("alias")
+    account_password_delete.set_defaults(func=command_account_password_delete)
+    account_password_status = account_password_sub.add_parser("status")
+    add_json_flag(account_password_status)
+    account_password_status.add_argument("alias")
+    account_password_status.set_defaults(func=command_account_password_status)
 
     send_cmd = subparsers.add_parser("send")
     add_json_flag(send_cmd)
