@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import socket
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -9,6 +10,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import mailctl
+from fastapi.testclient import TestClient
+from mailctl_app.presentation.api.app import create_app
 
 
 class MailCtlTestCase(unittest.TestCase):
@@ -260,6 +263,60 @@ class MailCtlTestCase(unittest.TestCase):
         self.assertEqual(result, {"smtp": "ok", "imap": "ok"})
         smtp_client.login.assert_called_once()
         imap_client.login.assert_called_once()
+
+    def test_api_health_and_scalar(self) -> None:
+        client = TestClient(create_app())
+        response = client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["service"], "mailctl-api")
+        docs = client.get("/scalar")
+        self.assertEqual(docs.status_code, 200)
+        self.assertIn("Scalar.createApiReference", docs.text)
+
+    def test_api_account_and_send_dry_run(self) -> None:
+        self.save_config()
+        client = TestClient(create_app())
+        accounts = client.get("/accounts")
+        self.assertEqual(accounts.status_code, 200)
+        self.assertTrue(accounts.json()["ok"])
+        send = client.post(
+            "/messages/send",
+            json={
+                "account": "personal",
+                "to": ["hr@example.com"],
+                "subject": "Application",
+                "body": "Hello",
+                "dry_run": True,
+                "yes": True,
+            },
+        )
+        self.assertEqual(send.status_code, 200)
+        payload = send.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"]["recipient_count"], 1)
+
+    def test_runtime_service_falls_back_when_port_busy(self) -> None:
+        from mailctl_app.domain.services import runtime_service
+
+        busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        busy_port = busy.getsockname()[1]
+        try:
+            selected_port, fallback_used = runtime_service.find_available_port("127.0.0.1", busy_port)
+        finally:
+            busy.close()
+        self.assertTrue(fallback_used)
+        self.assertNotEqual(selected_port, busy_port)
+
+    def test_install_parser_accepts_profiles_and_api_commands(self) -> None:
+        parser = mailctl.build_parser()
+        install_args = parser.parse_args(["install", "--profile", "cli+api", "--port", "9090"])
+        self.assertEqual(install_args.profile, "cli+api")
+        self.assertEqual(install_args.port, 9090)
+        api_args = parser.parse_args(["api", "status", "--json"])
+        self.assertEqual(api_args.command, "api")
+        self.assertEqual(api_args.api_command, "status")
 
 
 def stat_mode(path: Path) -> int:

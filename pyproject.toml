@@ -9,6 +9,9 @@ description = "A lightweight, agent-friendly email CLI written in Python."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "uvicorn>=0.30.0",
   "keyring>=25.6.0",
   "SecretStorage>=3.3.3; sys_platform == 'linux'",
 ]
@@ -18,3 +21,6 @@ mailctl = "mailctl:main"
 
 [tool.setuptools]
 py-modules = ["mailctl"]
+
+[tool.setuptools.packages.find]
+include = ["mailctl_app*"]
