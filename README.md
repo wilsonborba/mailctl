@@ -2,6 +2,8 @@
 
 `mailctl` is a lightweight, agent-friendly email CLI written in Python for Gmail-compatible SMTP/IMAP workflows.
 
+It also provides a FastAPI-based local/LAN API with Scalar documentation for the same practical mail operations.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -16,11 +18,24 @@ Fast path:
 ./install.sh
 ```
 
+Profile examples:
+
+```bash
+./install.sh --profile cli
+./install.sh --profile cli+api
+```
+
 Manual path:
 
 ```bash
 python3 mailctl.py install
 ```
+
+Available install profiles:
+
+- `cli`: install the CLI runtime only
+- `cli+api`: install the CLI runtime and prepare the API service unit
+- `full`: reserved for a future phase; currently installs the same foundations as `cli+api`
 
 What installation does:
 
@@ -54,6 +69,8 @@ To remove the installed executable later:
 ```bash
 mailctl uninstall
 ```
+
+Current service lifecycle support is Debian-oriented and uses `systemd --user`.
 
 ## Gmail setup
 
@@ -172,6 +189,64 @@ Notes:
 - `--yes` disables the confirmation prompt
 - `--dry-run` builds and validates the message without connecting to SMTP
 - `--json` returns stable machine-readable output
+
+## API mode
+
+Serve in the foreground:
+
+```bash
+mailctl api serve
+mailctl api serve --localhost-only
+mailctl api serve --host 0.0.0.0 --port 18080
+```
+
+Manage the background API service with `systemd --user`:
+
+```bash
+mailctl api start --json
+mailctl api status --json
+mailctl api restart --json
+mailctl api stop --json
+```
+
+Serving model for the current implementation:
+
+- default bind: `0.0.0.0`
+- default preferred port: `18080`
+- localhost-only override: `--localhost-only`
+- if the preferred port is busy, `mailctl` selects a free port automatically and persists it
+- intended usage: local machine or trusted LAN
+
+Scalar docs:
+
+```text
+http://127.0.0.1:18080/scalar
+```
+
+OpenAPI schema:
+
+```text
+http://127.0.0.1:18080/openapi.json
+```
+
+Example requests:
+
+```bash
+curl http://127.0.0.1:18080/health
+
+curl http://127.0.0.1:18080/accounts
+
+curl -X POST http://127.0.0.1:8080/messages/send \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "account": "personal",
+    "to": ["hr@example.com"],
+    "subject": "Application",
+    "body": "Hello",
+    "dry_run": true,
+    "yes": true
+  }'
+```
 
 ## Local drafts
 

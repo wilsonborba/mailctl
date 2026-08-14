@@ -1,0 +1,2 @@
+"""mailctl application package."""
+
