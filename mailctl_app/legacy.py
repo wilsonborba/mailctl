@@ -1188,6 +1188,10 @@ def command_account_password_status(args: argparse.Namespace) -> int:
 def maybe_write_draft(build: MessageBuildResult, args: argparse.Namespace) -> int:
     ensure_dir(drafts_root())
     draft_id = uuid.uuid4().hex[:12]
+    # Snapshot the text now: a draft must send exactly what was composed, even if
+    # --body-file/--html-file was used (draft send never re-reads those paths).
+    body_text = read_text_option(getattr(args, "body", None), getattr(args, "body_file", None))
+    html_text = read_text_option(getattr(args, "html", None), getattr(args, "html_file", None))
     data = {
         "id": draft_id,
         "timestamp": now_iso(),
@@ -1198,9 +1202,9 @@ def maybe_write_draft(build: MessageBuildResult, args: argparse.Namespace) -> in
         "bcc": split_addresses(getattr(args, "bcc", None)),
         "reply_to": split_addresses(getattr(args, "reply_to", None)),
         "subject": build.subject,
-        "body": getattr(args, "body", None),
+        "body": body_text,
         "body_file": getattr(args, "body_file", None),
-        "html": getattr(args, "html", None),
+        "html": html_text,
         "html_file": getattr(args, "html_file", None),
         "attach": getattr(args, "attach", None) or [],
     }
@@ -1485,17 +1489,26 @@ def args_from_draft(draft: dict[str, Any], parser: argparse.ArgumentParser) -> a
         "send",
         "--account",
         draft["account"],
-        "--subject",
-        draft.get("subject", ""),
+        f"--subject={draft.get('subject', '')}",
     ]
     for field in ("to", "cc", "bcc", "reply_to", "attach"):
         key = field.replace("_", "-")
         for item in draft.get(field, []):
             values.extend([f"--{key}", item])
     if draft.get("body") is not None:
-        values.extend(["--body", draft["body"]])
+        values.append(f"--body={draft['body']}")  # '=' form: body may start with '-'
+    elif draft.get("body_file"):
+        values.extend(["--body-file", draft["body_file"]])
     if draft.get("html") is not None:
-        values.extend(["--html", draft["html"]])
+        values.append(f"--html={draft['html']}")
+    elif draft.get("html_file"):
+        values.extend(["--html-file", draft["html_file"]])
+    if not any(v.startswith(("--body=", "--html=")) or v in ("--body-file", "--html-file") for v in values):
+        raise MailCtlError(
+            f"draft {draft.get('id')} has no body or html; refusing to send an empty email",
+            exit_code=EXIT_USAGE,
+            error_type="usage_error",
+        )
     return parser.parse_args(values)
 
 

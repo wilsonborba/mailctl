@@ -249,6 +249,41 @@ class MailCtlTestCase(unittest.TestCase):
         draft = mailctl.load_draft(draft_id)
         self.assertEqual(draft["subject"], "Draft")
 
+    def test_draft_from_body_file_keeps_text_when_sent(self) -> None:
+        self.save_config()
+        body_path = self.home / "body.txt"
+        body_path.write_text("您好 / Hello from a file", encoding="utf-8")
+        create_args = SimpleNamespace(
+            json=True, account="personal", from_address=None, to=["hr@example.com"], cc=None, bcc=None,
+            reply_to=None, subject="Draft", body=None, body_file=str(body_path), html=None, html_file=None,
+            attach=None, allow_many=False,
+        )
+        out = io.StringIO()
+        with redirect_stdout(out):
+            mailctl.command_draft_create(create_args)
+        draft_id = json.loads(out.getvalue())["result"]["draft_id"]
+        draft = mailctl.load_draft(draft_id)
+        self.assertEqual(draft["body"], "您好 / Hello from a file")
+        body_path.unlink()  # sending must not depend on the file still existing
+        send_args = mailctl.args_from_draft(draft, mailctl.build_parser())
+        build = mailctl.compose_message(send_args, config=mailctl.load_config(required=True))
+        self.assertIn("Hello from a file", build.message.get_body(("plain",)).get_content())
+
+    def test_legacy_draft_with_only_body_file_still_sends_text(self) -> None:
+        self.save_config()
+        body_path = self.home / "legacy.txt"
+        body_path.write_text("legacy body", encoding="utf-8")
+        draft = {"id": "x", "account": "personal", "subject": "S", "to": ["a@example.com"],
+                 "body": None, "body_file": str(body_path), "html": None, "html_file": None}
+        send_args = mailctl.args_from_draft(draft, mailctl.build_parser())
+        build = mailctl.compose_message(send_args, config=mailctl.load_config(required=True))
+        self.assertIn("legacy body", build.message.get_body(("plain",)).get_content())
+
+    def test_draft_without_any_body_is_refused(self) -> None:
+        draft = {"id": "x", "account": "personal", "subject": "S", "to": ["a@example.com"], "body": None, "html": None}
+        with self.assertRaises(mailctl.MailCtlError):
+            mailctl.args_from_draft(draft, mailctl.build_parser())
+
     def test_account_connectivity_test_uses_clients(self) -> None:
         self.save_config()
         smtp_client = mock.MagicMock()
